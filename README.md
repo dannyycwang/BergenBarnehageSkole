@@ -2,7 +2,7 @@
 
 這個專案把你要的流程拆成 3 個 Python 腳本：
 
-1. 抓 `statistikk-grunnskole` 頁面能下載的 CSV（盡量自動選 `Bergen`）。
+1. 先從 `statistikk-grunnskole` 首頁抓所有子統計頁，再逐頁按 `Eksporter` 下載 CSV（盡量自動選 `Bergen`）。
 2. 合併所有 CSV 成一張表。
 3. 做 Bergen 學校地圖。
 
@@ -22,7 +22,7 @@ python -m playwright install chromium
 python scripts/download_udir_csv.py
 ```
 
-檔案會放在 `data/raw/`。
+檔案會放在 `data/raw/`，並輸出 `data/raw/download_log.json` 讓你檢查哪些頁面下載失敗。
 
 ## 2) Merge 成一張表 + unique id 註記
 

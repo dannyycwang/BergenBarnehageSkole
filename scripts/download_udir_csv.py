@@ -1,110 +1,158 @@
 #!/usr/bin/env python3
-"""Use Playwright to download all visible CSV files from UDIR grunnskole page.
+"""Download CSV exports from UDIR grunnskole statistics pages.
 
-Notes:
-- Tries to set region filter to Bergen where region controls exist.
-- Clicks all buttons/links that contain "CSV" text.
-- Saves files under data/raw.
+Improvement over the previous version:
+- First discovers the detailed statistic subpages from the main overview page.
+- Visits each subpage and clicks its `Eksporter` action (CSV export in Statistikportalen UI).
+- Best-effort Bergen filter selection before export when such controls are present.
+- Saves metadata log so failures are visible instead of silently skipping.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from urllib.parse import urljoin, urlparse
 
-URL = "https://www.udir.no/tall-og-forskning/statistikk/statistikk-grunnskole/"
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+
+BASE_URL = "https://www.udir.no"
+ROOT_URL = f"{BASE_URL}/tall-og-forskning/statistikk/statistikk-grunnskole/"
 RAW_DIR = Path("data/raw")
-
-SECTION_TEXTS = [
-    "Fakta",
-    "Resultater",
-    "Trivsel og overganger",
-    "Vis mindre",
-    "Vis færre",
-]
+LOG_PATH = RAW_DIR / "download_log.json"
 
 
 def slugify(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", value).strip("_").lower()
 
 
-def try_set_bergen(page) -> None:
-    """Attempt to set any Region/Kommune/Area selectors to Bergen."""
-    candidates = [
-        "select",
-        "[role='combobox']",
-        "button[aria-haspopup='listbox']",
-    ]
-
-    for selector in candidates:
-        elements = page.locator(selector)
-        count = elements.count()
-        for i in range(count):
-            el = elements.nth(i)
-            try:
-                label = (el.inner_text(timeout=2000) or "").lower()
-            except Exception:
-                label = ""
-            try:
-                aria = (el.get_attribute("aria-label") or "").lower()
-            except Exception:
-                aria = ""
-            merged = f"{label} {aria}"
-            if any(x in merged for x in ["region", "kommune", "area", "fylke", "geografi"]):
-                try:
-                    if selector == "select":
-                        el.select_option(label=re.compile("bergen", re.I), timeout=3000)
-                    else:
-                        el.click(timeout=3000)
-                        page.get_by_role("option", name=re.compile("bergen", re.I)).first.click(timeout=3000)
-                    print("[info] Set filter to Bergen")
-                except Exception:
-                    pass
+def is_grunnskole_subpage(href: str) -> bool:
+    if not href:
+        return False
+    parsed = urlparse(href)
+    path = parsed.path.rstrip("/")
+    root = "/tall-og-forskning/statistikk/statistikk-grunnskole"
+    return path.startswith(root) and path != root
 
 
-def click_text_if_exists(page, text: str) -> None:
-    loc = page.get_by_text(text, exact=False)
-    if loc.count() > 0:
+def discover_subpages(page) -> list[str]:
+    hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.getAttribute('href'))")
+    urls = []
+    for href in hrefs:
+        if not href:
+            continue
+        full = urljoin(BASE_URL, href)
+        if is_grunnskole_subpage(full):
+            urls.append(full.rstrip("/") + "/")
+    return sorted(set(urls))
+
+
+def try_set_bergen(page) -> bool:
+    """Try multiple control styles used by Statistikportalen to select Bergen."""
+    # 1) direct option click if visible
+    try:
+        opt = page.get_by_text(re.compile(r"^Bergen$", re.I))
+        if opt.count() > 0:
+            opt.first.click(timeout=1500)
+            return True
+    except Exception:
+        pass
+
+    # 2) combobox style controls
+    combos = page.locator("[role='combobox'], select, button[aria-haspopup='listbox']")
+    for i in range(combos.count()):
+        c = combos.nth(i)
         try:
-            loc.first.click(timeout=3000)
+            c.click(timeout=1500)
+        except Exception:
+            continue
+
+        # try listbox option
+        try:
+            opt = page.get_by_role("option", name=re.compile("bergen", re.I))
+            if opt.count() > 0:
+                opt.first.click(timeout=1500)
+                return True
         except Exception:
             pass
 
-
-def download_all_csv(page, raw_dir: Path) -> list[Path]:
-    downloaded: list[Path] = []
-    buttons = page.locator("a,button")
-    seen = set()
-
-    for i in range(buttons.count()):
-        btn = buttons.nth(i)
-        text = (btn.inner_text(timeout=2000) or "").strip()
-        if "csv" not in text.lower():
-            continue
-
-        key = slugify(text) + f"_{i}"
-        if key in seen:
-            continue
-        seen.add(key)
-
+        # try plain text option in dropdown
         try:
-            with page.expect_download(timeout=15000) as download_info:
-                btn.click(timeout=4000)
-            dl = download_info.value
-            name = dl.suggested_filename or f"{key}.csv"
-            target = raw_dir / name
-            if target.exists():
-                target = raw_dir / f"{target.stem}_{i}{target.suffix}"
-            dl.save_as(str(target))
-            downloaded.append(target)
-            print(f"[ok] downloaded {target}")
-        except PlaywrightTimeoutError:
-            continue
+            txt = page.get_by_text(re.compile(r"\bBergen\b", re.I))
+            if txt.count() > 0:
+                txt.first.click(timeout=1500)
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def ensure_csv_selected(page) -> None:
+    """Best-effort: ensure export format is CSV before clicking Eksporter."""
+    # common pattern: "Filtype" followed by CSV option/button
+    try:
+        csv_text = page.get_by_text(re.compile(r"\bCSV\b", re.I))
+        if csv_text.count() > 0:
+            csv_text.first.click(timeout=1000)
+            return
+    except Exception:
+        pass
+
+    # select tag fallback
+    selects = page.locator("select")
+    for i in range(selects.count()):
+        s = selects.nth(i)
+        try:
+            s.select_option(label=re.compile("csv", re.I), timeout=1000)
+            return
         except Exception:
             continue
 
-    return downloaded
+
+def download_page_csv(page, url: str, raw_dir: Path) -> dict:
+    result = {
+        "page": url,
+        "downloaded": False,
+        "filename": None,
+        "bergen_selected": False,
+        "error": None,
+    }
+
+    page.goto(url, wait_until="networkidle", timeout=90000)
+    page.wait_for_timeout(4000)
+
+    result["bergen_selected"] = try_set_bergen(page)
+    ensure_csv_selected(page)
+
+    # some pages use button, others link styled as button
+    exporter = page.get_by_role("button", name=re.compile(r"Eksporter", re.I))
+    if exporter.count() == 0:
+        exporter = page.get_by_text(re.compile(r"Eksporter", re.I))
+
+    if exporter.count() == 0:
+        result["error"] = "Eksporter control not found"
+        return result
+
+    try:
+        with page.expect_download(timeout=25000) as download_info:
+            exporter.first.click(timeout=5000)
+        dl = download_info.value
+        suggested = dl.suggested_filename or f"{slugify(urlparse(url).path)}.csv"
+        target = raw_dir / suggested
+        if target.exists():
+            target = raw_dir / f"{target.stem}_{slugify(urlparse(url).path)}{target.suffix}"
+        dl.save_as(str(target))
+        result["downloaded"] = True
+        result["filename"] = target.name
+    except PlaywrightTimeoutError:
+        result["error"] = "Timed out waiting for download"
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
 
 
 def main() -> None:
@@ -114,17 +162,22 @@ def main() -> None:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
-        page.goto(URL, wait_until="domcontentloaded", timeout=60000)
 
-        for section in SECTION_TEXTS:
-            click_text_if_exists(page, section)
+        page.goto(ROOT_URL, wait_until="networkidle", timeout=90000)
+        subpages = discover_subpages(page)
 
-        try_set_bergen(page)
-        files = download_all_csv(page, RAW_DIR)
+        logs = []
+        for url in subpages:
+            logs.append(download_page_csv(page, url, RAW_DIR))
 
         browser.close()
 
-    print(f"Downloaded {len(files)} CSV files into {RAW_DIR}")
+    LOG_PATH.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    ok = sum(1 for item in logs if item["downloaded"])
+    print(f"Discovered {len(subpages)} subpages")
+    print(f"Downloaded {ok} CSV files to {RAW_DIR}")
+    print(f"Log written to {LOG_PATH}")
 
 
 if __name__ == "__main__":
