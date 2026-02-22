@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Download CSV exports from UDIR grunnskole statistics pages.
+"""Download UDIR CSV by direct click flow: Eksporter -> CSV.
 
-Workflow aligned with user request:
-- Open each `statistikk-grunnskole` subpage.
-- Keep defaults, only set Enhet to Vestland/Bergen when available.
-- Click Eksporter and save CSV.
-- If Enhet filter cannot be set on a page, export with default/all selection.
+This keeps the interaction simple and close to manual behavior.
 """
 
 from __future__ import annotations
@@ -22,11 +18,6 @@ BASE_URL = "https://www.udir.no"
 ROOT_URL = f"{BASE_URL}/tall-og-forskning/statistikk/statistikk-grunnskole/"
 RAW_DIR = Path("data/raw")
 LOG_PATH = RAW_DIR / "download_log.json"
-
-
-ENHET_LABEL_RE = re.compile(r"enhet", re.I)
-VESTLAND_RE = re.compile(r"vestland", re.I)
-BERGEN_RE = re.compile(r"bergen", re.I)
 
 
 def slugify(value: str) -> str:
@@ -54,142 +45,38 @@ def discover_subpages(page) -> list[str]:
     return sorted(set(urls))
 
 
-def click_first(locator, timeout=1500) -> bool:
+def click_export_then_csv_and_download(page, output_dir: Path, source_url: str) -> tuple[bool, str | None, str | None]:
+    """Return (ok, filename, error)."""
     try:
-        if locator.count() > 0:
-            locator.first.click(timeout=timeout)
-            return True
-    except Exception:
-        return False
-    return False
+        export_btn = page.get_by_text(re.compile(r"^\s*Eksporter\s*$", re.I))
+        if export_btn.count() == 0:
+            export_btn = page.get_by_role("button", name=re.compile("Eksporter", re.I))
+        if export_btn.count() == 0:
+            return False, None, "Eksporter control not found"
 
+        export_btn.first.click(timeout=8000)
+        page.wait_for_timeout(300)
 
-def open_enhet_control(page) -> bool:
-    """Open the Enhet filter control (combobox/button/select) if present."""
-    # First try by associated label text around control
-    candidates = page.locator("[role='combobox'], button[aria-haspopup='listbox'], select")
-    for i in range(candidates.count()):
-        c = candidates.nth(i)
-        blob = ""
-        try:
-            blob += (c.inner_text(timeout=300) or "") + " "
-        except Exception:
-            pass
-        try:
-            blob += (c.get_attribute("aria-label") or "") + " "
-        except Exception:
-            pass
-        try:
-            blob += (c.get_attribute("name") or "") + " "
-        except Exception:
-            pass
-        if ENHET_LABEL_RE.search(blob):
-            try:
-                c.click(timeout=1500)
-                return True
-            except Exception:
-                continue
+        csv_option = page.get_by_text(re.compile(r"^\s*CSV\s*$", re.I))
+        if csv_option.count() == 0:
+            csv_option = page.get_by_role("button", name=re.compile(r"CSV", re.I))
+        if csv_option.count() == 0:
+            return False, None, "CSV option not found after clicking Eksporter"
 
-    # Fallback: click visible "Enhet" text near filter panel
-    if click_first(page.get_by_text(ENHET_LABEL_RE), timeout=1200):
-        return True
+        with page.expect_download(timeout=35000) as dl_info:
+            csv_option.first.click(timeout=8000)
 
-    return False
-
-
-def select_enhet_vestland_bergen(page) -> tuple[bool, str]:
-    """Try setting Enhet filter to Vestland/Bergen.
-
-    Returns: (selected, detail)
-    """
-    # Case 1: direct composite option
-    if open_enhet_control(page):
-        if click_first(page.get_by_role("option", name=re.compile(r"vestland\s*/\s*bergen", re.I))):
-            return True, "selected via option Vestland/Bergen"
-        if click_first(page.get_by_text(re.compile(r"vestland\s*/\s*bergen", re.I))):
-            return True, "selected via text Vestland/Bergen"
-
-    # Case 2: two-step hierarchy Vestland -> Bergen
-    if open_enhet_control(page):
-        if click_first(page.get_by_role("option", name=VESTLAND_RE)) or click_first(page.get_by_text(VESTLAND_RE)):
-            page.wait_for_timeout(300)
-            if click_first(page.get_by_role("option", name=BERGEN_RE)) or click_first(page.get_by_text(BERGEN_RE)):
-                return True, "selected via hierarchy Vestland -> Bergen"
-
-    # Case 3: any Bergen option once Enhet opened
-    if open_enhet_control(page):
-        if click_first(page.get_by_role("option", name=BERGEN_RE)) or click_first(page.get_by_text(BERGEN_RE)):
-            return True, "selected Bergen under Enhet"
-
-    return False, "Enhet Vestland/Bergen not available on this page"
-
-
-def ensure_csv_selected(page) -> None:
-    try:
-        csv_text = page.get_by_text(re.compile(r"\bCSV\b", re.I))
-        if csv_text.count() > 0:
-            csv_text.first.click(timeout=1000)
-            return
-    except Exception:
-        pass
-
-    selects = page.locator("select")
-    for i in range(selects.count()):
-        s = selects.nth(i)
-        try:
-            s.select_option(label=re.compile("csv", re.I), timeout=1000)
-            return
-        except Exception:
-            continue
-
-
-def download_page_csv(page, url: str, raw_dir: Path) -> dict:
-    result = {
-        "page": url,
-        "downloaded": False,
-        "filename": None,
-        "enhet_vestland_bergen_selected": False,
-        "selection_detail": None,
-        "fallback_to_default_selection": False,
-        "error": None,
-    }
-
-    page.goto(url, wait_until="networkidle", timeout=90000)
-    page.wait_for_timeout(4500)
-
-    selected, detail = select_enhet_vestland_bergen(page)
-    result["enhet_vestland_bergen_selected"] = selected
-    result["selection_detail"] = detail
-    if not selected:
-        result["fallback_to_default_selection"] = True
-
-    ensure_csv_selected(page)
-
-    exporter = page.get_by_role("button", name=re.compile(r"Eksporter", re.I))
-    if exporter.count() == 0:
-        exporter = page.get_by_text(re.compile(r"Eksporter", re.I))
-
-    if exporter.count() == 0:
-        result["error"] = "Eksporter control not found"
-        return result
-
-    try:
-        with page.expect_download(timeout=35000) as download_info:
-            exporter.first.click(timeout=6000)
-        dl = download_info.value
-        suggested = dl.suggested_filename or f"{slugify(urlparse(url).path)}.csv"
-        target = raw_dir / suggested
+        dl = dl_info.value
+        suggested = dl.suggested_filename or f"{slugify(urlparse(source_url).path)}.csv"
+        target = output_dir / suggested
         if target.exists():
-            target = raw_dir / f"{target.stem}_{slugify(urlparse(url).path)}{target.suffix}"
+            target = output_dir / f"{target.stem}_{slugify(urlparse(source_url).path)}{target.suffix}"
         dl.save_as(str(target))
-        result["downloaded"] = True
-        result["filename"] = target.name
+        return True, target.name, None
     except PlaywrightTimeoutError:
-        result["error"] = "Timed out waiting for download"
+        return False, None, "Timed out waiting for download"
     except Exception as exc:
-        result["error"] = str(exc)
-
-    return result
+        return False, None, str(exc)
 
 
 def main() -> None:
@@ -203,19 +90,29 @@ def main() -> None:
         page.goto(ROOT_URL, wait_until="networkidle", timeout=90000)
         subpages = discover_subpages(page)
 
-        logs = []
+        logs: list[dict] = []
         for url in subpages:
-            logs.append(download_page_csv(page, url, RAW_DIR))
+            result = {
+                "page": url,
+                "downloaded": False,
+                "filename": None,
+                "error": None,
+            }
+            page.goto(url, wait_until="networkidle", timeout=90000)
+            page.wait_for_timeout(2500)
+            ok, filename, err = click_export_then_csv_and_download(page, RAW_DIR, url)
+            result["downloaded"] = ok
+            result["filename"] = filename
+            result["error"] = err
+            logs.append(result)
 
         browser.close()
 
     LOG_PATH.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    ok = sum(1 for item in logs if item["downloaded"])
-    scoped = sum(1 for item in logs if item["enhet_vestland_bergen_selected"])
+    ok = sum(1 for row in logs if row["downloaded"])
     print(f"Discovered {len(subpages)} subpages")
     print(f"Downloaded {ok} CSV files to {RAW_DIR}")
-    print(f"Applied Enhet Vestland/Bergen on {scoped} pages")
     print(f"Log written to {LOG_PATH}")
 
 
