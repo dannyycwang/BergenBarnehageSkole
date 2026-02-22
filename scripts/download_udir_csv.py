@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Download CSV exports from UDIR grunnskole statistics pages.
 
-Improvement over the previous version:
-- First discovers the detailed statistic subpages from the main overview page.
-- Visits each subpage and clicks its `Eksporter` action (CSV export in Statistikportalen UI).
-- Best-effort Bergen filter selection before export when such controls are present.
-- Saves metadata log so failures are visible instead of silently skipping.
+Workflow aligned with user request:
+- Open each `statistikk-grunnskole` subpage.
+- Keep defaults, only set Enhet to Vestland/Bergen when available.
+- Click Eksporter and save CSV.
+- If Enhet filter cannot be set on a page, export with default/all selection.
 """
 
 from __future__ import annotations
@@ -22,6 +22,11 @@ BASE_URL = "https://www.udir.no"
 ROOT_URL = f"{BASE_URL}/tall-og-forskning/statistikk/statistikk-grunnskole/"
 RAW_DIR = Path("data/raw")
 LOG_PATH = RAW_DIR / "download_log.json"
+
+
+ENHET_LABEL_RE = re.compile(r"enhet", re.I)
+VESTLAND_RE = re.compile(r"vestland", re.I)
+BERGEN_RE = re.compile(r"bergen", re.I)
 
 
 def slugify(value: str) -> str:
@@ -49,50 +54,77 @@ def discover_subpages(page) -> list[str]:
     return sorted(set(urls))
 
 
-def try_set_bergen(page) -> bool:
-    """Try multiple control styles used by Statistikportalen to select Bergen."""
-    # 1) direct option click if visible
+def click_first(locator, timeout=1500) -> bool:
     try:
-        opt = page.get_by_text(re.compile(r"^Bergen$", re.I))
-        if opt.count() > 0:
-            opt.first.click(timeout=1500)
+        if locator.count() > 0:
+            locator.first.click(timeout=timeout)
             return True
     except Exception:
-        pass
+        return False
+    return False
 
-    # 2) combobox style controls
-    combos = page.locator("[role='combobox'], select, button[aria-haspopup='listbox']")
-    for i in range(combos.count()):
-        c = combos.nth(i)
-        try:
-            c.click(timeout=1500)
-        except Exception:
-            continue
 
-        # try listbox option
+def open_enhet_control(page) -> bool:
+    """Open the Enhet filter control (combobox/button/select) if present."""
+    # First try by associated label text around control
+    candidates = page.locator("[role='combobox'], button[aria-haspopup='listbox'], select")
+    for i in range(candidates.count()):
+        c = candidates.nth(i)
+        blob = ""
         try:
-            opt = page.get_by_role("option", name=re.compile("bergen", re.I))
-            if opt.count() > 0:
-                opt.first.click(timeout=1500)
-                return True
+            blob += (c.inner_text(timeout=300) or "") + " "
         except Exception:
             pass
-
-        # try plain text option in dropdown
         try:
-            txt = page.get_by_text(re.compile(r"\bBergen\b", re.I))
-            if txt.count() > 0:
-                txt.first.click(timeout=1500)
-                return True
+            blob += (c.get_attribute("aria-label") or "") + " "
         except Exception:
             pass
+        try:
+            blob += (c.get_attribute("name") or "") + " "
+        except Exception:
+            pass
+        if ENHET_LABEL_RE.search(blob):
+            try:
+                c.click(timeout=1500)
+                return True
+            except Exception:
+                continue
+
+    # Fallback: click visible "Enhet" text near filter panel
+    if click_first(page.get_by_text(ENHET_LABEL_RE), timeout=1200):
+        return True
 
     return False
 
 
+def select_enhet_vestland_bergen(page) -> tuple[bool, str]:
+    """Try setting Enhet filter to Vestland/Bergen.
+
+    Returns: (selected, detail)
+    """
+    # Case 1: direct composite option
+    if open_enhet_control(page):
+        if click_first(page.get_by_role("option", name=re.compile(r"vestland\s*/\s*bergen", re.I))):
+            return True, "selected via option Vestland/Bergen"
+        if click_first(page.get_by_text(re.compile(r"vestland\s*/\s*bergen", re.I))):
+            return True, "selected via text Vestland/Bergen"
+
+    # Case 2: two-step hierarchy Vestland -> Bergen
+    if open_enhet_control(page):
+        if click_first(page.get_by_role("option", name=VESTLAND_RE)) or click_first(page.get_by_text(VESTLAND_RE)):
+            page.wait_for_timeout(300)
+            if click_first(page.get_by_role("option", name=BERGEN_RE)) or click_first(page.get_by_text(BERGEN_RE)):
+                return True, "selected via hierarchy Vestland -> Bergen"
+
+    # Case 3: any Bergen option once Enhet opened
+    if open_enhet_control(page):
+        if click_first(page.get_by_role("option", name=BERGEN_RE)) or click_first(page.get_by_text(BERGEN_RE)):
+            return True, "selected Bergen under Enhet"
+
+    return False, "Enhet Vestland/Bergen not available on this page"
+
+
 def ensure_csv_selected(page) -> None:
-    """Best-effort: ensure export format is CSV before clicking Eksporter."""
-    # common pattern: "Filtype" followed by CSV option/button
     try:
         csv_text = page.get_by_text(re.compile(r"\bCSV\b", re.I))
         if csv_text.count() > 0:
@@ -101,7 +133,6 @@ def ensure_csv_selected(page) -> None:
     except Exception:
         pass
 
-    # select tag fallback
     selects = page.locator("select")
     for i in range(selects.count()):
         s = selects.nth(i)
@@ -117,17 +148,23 @@ def download_page_csv(page, url: str, raw_dir: Path) -> dict:
         "page": url,
         "downloaded": False,
         "filename": None,
-        "bergen_selected": False,
+        "enhet_vestland_bergen_selected": False,
+        "selection_detail": None,
+        "fallback_to_default_selection": False,
         "error": None,
     }
 
     page.goto(url, wait_until="networkidle", timeout=90000)
-    page.wait_for_timeout(4000)
+    page.wait_for_timeout(4500)
 
-    result["bergen_selected"] = try_set_bergen(page)
+    selected, detail = select_enhet_vestland_bergen(page)
+    result["enhet_vestland_bergen_selected"] = selected
+    result["selection_detail"] = detail
+    if not selected:
+        result["fallback_to_default_selection"] = True
+
     ensure_csv_selected(page)
 
-    # some pages use button, others link styled as button
     exporter = page.get_by_role("button", name=re.compile(r"Eksporter", re.I))
     if exporter.count() == 0:
         exporter = page.get_by_text(re.compile(r"Eksporter", re.I))
@@ -137,8 +174,8 @@ def download_page_csv(page, url: str, raw_dir: Path) -> dict:
         return result
 
     try:
-        with page.expect_download(timeout=25000) as download_info:
-            exporter.first.click(timeout=5000)
+        with page.expect_download(timeout=35000) as download_info:
+            exporter.first.click(timeout=6000)
         dl = download_info.value
         suggested = dl.suggested_filename or f"{slugify(urlparse(url).path)}.csv"
         target = raw_dir / suggested
@@ -175,8 +212,10 @@ def main() -> None:
     LOG_PATH.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
 
     ok = sum(1 for item in logs if item["downloaded"])
+    scoped = sum(1 for item in logs if item["enhet_vestland_bergen_selected"])
     print(f"Discovered {len(subpages)} subpages")
     print(f"Downloaded {ok} CSV files to {RAW_DIR}")
+    print(f"Applied Enhet Vestland/Bergen on {scoped} pages")
     print(f"Log written to {LOG_PATH}")
 
 
