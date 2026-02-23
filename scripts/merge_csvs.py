@@ -79,6 +79,50 @@ def pick_id_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+def disambiguate_for_merge(
+    merged: pd.DataFrame,
+    df: pd.DataFrame,
+    key: str,
+    source_name: str,
+    notes: list[str],
+) -> pd.DataFrame:
+    """Avoid merge errors caused by repeated overlapping columns.
+
+    We keep the left frame unchanged and rename right overlapping columns
+    (except merge key) with a file-specific suffix.
+    """
+
+    right = df.copy()
+
+    # `source_file` from each incoming dataset is useful only for first frame.
+    # Keeping all of them creates repeated `source_file_dup` conflicts.
+    if "source_file" in right.columns and key != "source_file":
+        right = right.drop(columns=["source_file"])
+
+    overlaps = [c for c in right.columns if c != key and c in merged.columns]
+    if not overlaps:
+        return right
+
+    suffix = _normalize_text(Path(source_name).stem) or "src"
+    rename_map: dict[str, str] = {}
+
+    for col in overlaps:
+        candidate = f"{col}_{suffix}"
+        idx = 2
+        while candidate in merged.columns or candidate in right.columns or candidate in rename_map.values():
+            candidate = f"{col}_{suffix}_{idx}"
+            idx += 1
+        rename_map[col] = candidate
+
+    right = right.rename(columns=rename_map)
+    notes.append(
+        f"- `{source_name}`: renamed overlapping columns before merge ({', '.join(overlaps[:5])}"
+        + ("..." if len(overlaps) > 5 else "")
+        + ")."
+    )
+    return right
+
+
 def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     priority_patterns = [
         "source_file",
@@ -171,7 +215,7 @@ def main() -> None:
     merged: pd.DataFrame | None = None
     merge_key: str | None = None
 
-    for _, df, id_col in normalized_frames:
+    for source_name, df, id_col in normalized_frames:
         if merged is None:
             merged = df
             merge_key = id_col
@@ -187,18 +231,16 @@ def main() -> None:
             key = common[0] if common else None
 
         if key:
-            merged = merged.merge(df, on=key, how="outer", suffixes=("", "_dup"))
+            right = disambiguate_for_merge(merged, df, key, source_name, notes)
+            merged = merged.merge(right, on=key, how="outer")
         else:
             merged = pd.concat([merged, df], ignore_index=True, sort=False)
 
     assert merged is not None
 
-    dup_cols = [c for c in merged.columns if c.endswith("_dup")]
-    if dup_cols:
-        merged = merged.drop(columns=dup_cols)
-
     merged = reorder_columns(merged)
-    merged = merged.sort_values(by=["source_file"], kind="stable", na_position="last")
+    if "source_file" in merged.columns:
+        merged = merged.sort_values(by=["source_file"], kind="stable", na_position="last")
 
     merged.to_csv(MERGED_CSV, index=False, encoding="utf-8-sig")
 
