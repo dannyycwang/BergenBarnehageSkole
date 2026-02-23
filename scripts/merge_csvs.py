@@ -15,13 +15,12 @@ REPORT = OUT_DIR / "merge_report.md"
 ID_HINTS = ["skole", "school", "school_name", "enhetsnummer", "orgnr", "unit", "id"]
 
 
+def collect_csv_files(root: Path) -> list[Path]:
+    return sorted(p for p in root.rglob("*.csv") if p.is_file())
+
+
 def read_csv_flexible(path: Path) -> pd.DataFrame:
-    """Read CSV files with flexible delimiter + encoding handling.
-
-    UDIR exports and manually downloaded regional files can use different
-    encodings (utf-8, utf-8-sig, cp1252, latin-1) and delimiters.
-    """
-
+    """Read CSV files with flexible delimiter + encoding handling."""
     separators = [",", ";", "\t", "|"]
     encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
     last_error: Exception | None = None
@@ -34,10 +33,7 @@ def read_csv_flexible(path: Path) -> pd.DataFrame:
                     return df
             except Exception as exc:
                 last_error = exc
-                continue
 
-    # Last attempt: let pandas auto-detect separator with python engine,
-    # while still trying practical encodings.
     for enc in encodings:
         try:
             return pd.read_csv(path, sep=None, engine="python", encoding=enc)
@@ -46,8 +42,6 @@ def read_csv_flexible(path: Path) -> pd.DataFrame:
 
     if last_error is not None:
         raise last_error
-
-    # Defensive fallback (should never hit in practice)
     return pd.read_csv(path)
 
 
@@ -72,11 +66,68 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def clean_noise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop index-like unnamed columns that are fully empty."""
+    df = df.copy()
+    drop_cols = [c for c in df.columns if c.startswith("unnamed") and df[c].isna().all()]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    return df
+
+
 def pick_id_column(df: pd.DataFrame) -> str | None:
     for col in df.columns:
         if any(h in col.lower() for h in ID_HINTS):
             return col
     return None
+
+
+def choose_merge_key(merged: pd.DataFrame, df: pd.DataFrame, current_key: str | None, id_col: str | None) -> str | None:
+    if current_key and current_key in df.columns:
+        return current_key
+    if id_col and id_col in merged.columns and id_col in df.columns:
+        return id_col
+    return None
+
+
+def has_duplicate_key_rows(df: pd.DataFrame, key: str) -> bool:
+    return bool(df[key].notna().any() and df[key].duplicated().any())
+
+
+def disambiguate_for_merge(
+    merged: pd.DataFrame,
+    df: pd.DataFrame,
+    key: str,
+    source_name: str,
+    notes: list[str],
+) -> pd.DataFrame:
+    right = df.copy()
+
+    if "source_file" in right.columns and key != "source_file":
+        right = right.drop(columns=["source_file"])
+
+    overlaps = [c for c in right.columns if c != key and c in merged.columns]
+    if not overlaps:
+        return right
+
+    suffix = _normalize_text(Path(source_name).stem) or "src"
+    rename_map: dict[str, str] = {}
+
+    for col in overlaps:
+        candidate = f"{col}_{suffix}"
+        idx = 2
+        while candidate in merged.columns or candidate in right.columns or candidate in rename_map.values():
+            candidate = f"{col}_{suffix}_{idx}"
+            idx += 1
+        rename_map[col] = candidate
+
+    right = right.rename(columns=rename_map)
+    notes.append(
+        f"- `{source_name}`: renamed overlapping columns before merge ({', '.join(overlaps[:5])}"
+        + ("..." if len(overlaps) > 5 else "")
+        + ")."
+    )
+    return right
 
 
 def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -111,7 +162,6 @@ def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prettify_for_excel(path: Path, sheet_name: str = "merged") -> None:
-    # openpyxl is optional; function is called only when available.
     from openpyxl import load_workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -147,7 +197,7 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     SOURCE_DIR.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(SOURCE_DIR.glob("*.csv"))
+    files = collect_csv_files(SOURCE_DIR)
     if not files:
         raise SystemExit(
             "No CSV files found in E_report/. Please place your downloaded files there, then rerun."
@@ -157,48 +207,48 @@ def main() -> None:
     notes: list[str] = []
 
     for csv_path in files:
-        df = normalize_columns(read_csv_flexible(csv_path))
+        rel_name = str(csv_path.relative_to(SOURCE_DIR))
+        df = clean_noise_columns(normalize_columns(read_csv_flexible(csv_path)))
         id_col = pick_id_column(df)
 
         if id_col is None:
-            notes.append(f"- `{csv_path.name}`: no clear unique ID column found.")
+            notes.append(f"- `{rel_name}`: no clear unique ID column found.")
         elif "skole" not in id_col and "school" not in id_col:
-            notes.append(f"- `{csv_path.name}`: merged by `{id_col}` (not school name).")
+            notes.append(f"- `{rel_name}`: merged by `{id_col}` (not school name).")
 
-        df["source_file"] = csv_path.name
-        normalized_frames.append((csv_path.name, df, id_col))
+        df["source_file"] = rel_name
+        normalized_frames.append((rel_name, df, id_col))
 
     merged: pd.DataFrame | None = None
     merge_key: str | None = None
 
-    for _, df, id_col in normalized_frames:
+    for source_name, df, id_col in normalized_frames:
         if merged is None:
             merged = df
             merge_key = id_col
             continue
 
-        if merge_key and merge_key in df.columns:
-            key = merge_key
-        elif id_col and id_col in merged.columns and id_col in df.columns:
-            key = id_col
-            merge_key = key
-        else:
-            common = [c for c in merged.columns if c in df.columns and c != "source_file"]
-            key = common[0] if common else None
+        key = choose_merge_key(merged, df, merge_key, id_col)
+
+        if key and has_duplicate_key_rows(merged, key):
+            notes.append(f"- `{source_name}`: fallback to row concat because current merged data has duplicate key `{key}`.")
+            key = None
+        if key and has_duplicate_key_rows(df, key):
+            notes.append(f"- `{source_name}`: fallback to row concat because file has duplicate key `{key}`.")
+            key = None
 
         if key:
-            merged = merged.merge(df, on=key, how="outer", suffixes=("", "_dup"))
+            merge_key = key
+            right = disambiguate_for_merge(merged, df, key, source_name, notes)
+            merged = merged.merge(right, on=key, how="outer")
         else:
             merged = pd.concat([merged, df], ignore_index=True, sort=False)
 
     assert merged is not None
 
-    dup_cols = [c for c in merged.columns if c.endswith("_dup")]
-    if dup_cols:
-        merged = merged.drop(columns=dup_cols)
-
     merged = reorder_columns(merged)
-    merged = merged.sort_values(by=["source_file"], kind="stable", na_position="last")
+    if "source_file" in merged.columns:
+        merged = merged.sort_values(by=["source_file"], kind="stable", na_position="last")
 
     merged.to_csv(MERGED_CSV, index=False, encoding="utf-8-sig")
 
