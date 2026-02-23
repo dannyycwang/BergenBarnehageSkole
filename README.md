@@ -18,7 +18,7 @@ pip install -e .
 
 ## 1) 放入資料
 
-把所有來源 CSV 放到：
+把所有來源 CSV 放到（可放子資料夾，會遞迴掃描）：
 
 ```text
 E_report/
