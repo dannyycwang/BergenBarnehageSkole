@@ -16,15 +16,38 @@ ID_HINTS = ["skole", "school", "school_name", "enhetsnummer", "orgnr", "unit", "
 
 
 def read_csv_flexible(path: Path) -> pd.DataFrame:
-    for sep in [",", ";", "\t", "|"]:
-        try:
-            df = pd.read_csv(path, sep=sep)
-            if df.shape[1] > 1:
-                return df
-        except Exception:
-            continue
+    """Read CSV files with flexible delimiter + encoding handling.
 
-    # fallback: let pandas sniff or fail with original error message
+    UDIR exports and manually downloaded regional files can use different
+    encodings (utf-8, utf-8-sig, cp1252, latin-1) and delimiters.
+    """
+
+    separators = [",", ";", "\t", "|"]
+    encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
+    last_error: Exception | None = None
+
+    for enc in encodings:
+        for sep in separators:
+            try:
+                df = pd.read_csv(path, sep=sep, encoding=enc)
+                if df.shape[1] > 1:
+                    return df
+            except Exception as exc:
+                last_error = exc
+                continue
+
+    # Last attempt: let pandas auto-detect separator with python engine,
+    # while still trying practical encodings.
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, sep=None, engine="python", encoding=enc)
+        except Exception as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+
+    # Defensive fallback (should never hit in practice)
     return pd.read_csv(path)
 
 
